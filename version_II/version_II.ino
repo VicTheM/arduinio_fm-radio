@@ -1,109 +1,184 @@
+/*******************************************************************************************
+  THERE ARE 4 VOLUME POINTS (25, 50, 75, 100). TO INCREASE THE NUMBER OF POSSIBLE VOLUMES
+  YOU MAY CHANGE THE VOLUME POINTS TO (10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+  LIKEWISE WHERE mapFloat() IS CALLED FOR VOLUME, INSTEAD OF USING 0 AND 1023 AS THE
+  RANGE OF INPUT VALUES, YOU MAY USE 5 TO 1000 CONSIDERING THE POTENTIOMETER NEVER
+  REACHES IT'S MAXIMUM VALUE
+********************************************************************************************/
+
 #include <TEA5767Radio.h>
 #include <LiquidCrystal_I2C.h>
 #include <Wire.h>
+#define DEFAULT_FREQ 95.1                       // initial frequency in MHz
+#define ERROR 0.1                               // allowable discrepancy in any reading
 
-#define VOLUME_ERROR 1
+/*-------------------------------- GLOBAL CONSTANTS ---------------------------------------*/
+LiquidCrystal_I2C lcd(0x27, 16, 2);             // addrress may vary based on arduino
+TEA5767Radio radio = TEA5767Radio();
 
-LiquidCrystal_I2C lcd(0x27, 16, 2);
-
-const int volumePot = A3;
-int mappedVolumeValue, prevMappedVolumeValue;
-
+const int volume_pot = A3;
+float prevVol = 0.0;
+float currentVol = 0.0;
+char volStr[10];
 byte volume_character[] = { B00001, B00011, B10111, B10111, B10111, B10111, B00011, B00001 };
-byte volume_bar[] = { B00000, B01110, B01110, B01110, B01110, B01110, B01110, B00000 };
-byte radio_character[] = { B10000, B10000, B11111, B10001, B10001, B11111, B10111, B11111 };
+const float volumePoints[] = { 0.0, 25.0, 50.0, 75.0, 100 };
+const int numVolumePoints = sizeof(volumePoints) / sizeof(float);
 
+const int tunePot = A1;
+char freqStr[10];
+float currentFreq = DEFAULT_FREQ;
+const float broadcastFrequencies[] = {
+  88.9, 89.7, 90.9, 91.3, 92.3, 93.7, 94.7, 95.1, 96.1, 96.9, 97.3, 98.1, 99.3, 99.9, 100.5,
+  101.5, 102.3, 103.1, 103.5, 104.3, 105.1, 105.9, 106.5, 107.5
+  };
+const int numBroadcastFrequencies = sizeof(broadcastFrequencies) / sizeof(broadcastFrequencies[0]);
+const float nonBroadcastFrequencies[] = {
+  89.3, 90.3, 91.8, 92.8, 93.2, 94.2, 95.8, 96.5, 97.1, 98.0, 98.7,
+  99.5, 100.1, 101.0, 101.8, 102.7, 104.0, 104.7, 105.5, 106.1, 107.0
+  };
+const int numNonBroadcastFrequencies = sizeof(nonBroadcastFrequencies) / sizeof(nonBroadcastFrequencies[0]);
+
+
+/* ------------------------------ FUNCTION DEFINITIONS ------------------------------------*/
 float mapFloat(long x, long in_min, long in_max, float out_min, float out_max) {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-void generate_volume_bars(int vol) {
-  lcd.setCursor(0, 1);
-  lcd.write(byte(1));//Write volume icon
-  for (int i = 0; i < vol; i++) {
-    lcd.write(byte(2));//Write volume bar
+
+/**
+ * This function write the current station to the lcd
+ */
+void writeToLcd(char *frequency) {
+  lcd.setCursor(0, 0);
+  lcd.print("               ");
+  lcd.setCursor(0, 0);
+  if (strcmp(frequency, "103.1") == 0) {
+    lcd.print("UNILAG FM 103.1");
+  }
+  else if (strcmp(frequency, "95.1") == 0) {
+    lcd.print("WAZOBIA FM 95.1");
+  }
+  else {
+    lcd.print("Freq: ");
+    lcd.print(frequency);
   }
 }
 
-void writeToLcd(char *frequency, int volume) {
-  lcd.clear();
-  lcd.setCursor(0, 0); // lcd.setCursor(col, row);
-
-  lcd.write(byte(0));//Write radio icon
-  lcd.print(" ");
-  lcd.print(frequency);
-  lcd.print(" MHz");
-
-  generate_volume_bars(volume);
+void writeVolume(char *volume) {
+  lcd.setCursor(2, 1);
+  lcd.print("              ");
+  lcd.setCursor(2, 1);
+  lcd.print(volume);
+  lcd.print(" %");
 }
 
+
+/**
+ * This function returns the mean of a set of readings from a POT
+ */
 float getSmoothedReading(int pin, int numReadings) {
-  analogReference("DEFAULT");//Max voltage = 5v for tune pot
   long sum = 0;
   for (int i = 0; i < numReadings; i++) {
     sum += analogRead(pin);
-    delay(5); // Small delay to allow ADC to settle
+    delay(10); // Small delay to allow ADC to settle
   }
   return sum / numReadings;
 }
-float getMaxReading(int pin, int numReadings) {
-  analogReference("INTERNAL");//1.1V inorder to more accurately read volume pot
-  int max = 0;
-  for (int i = 0; i < numReadings; i++) {
-    if(max < analogRead(pin))
-    {
-      max = analogRead(pin);
+
+
+/**
+ * This function picks from our set of predefined frequency
+ * based on the proximity of the parameter passed to it
+ * It helps quantize our frequency band thereby increasing
+ * tunning accuracy
+ */
+float quantizeFrequency(float freq) {
+  float closestFreq = broadcastFrequencies[0];
+  float minDiff = abs(freq - closestFreq);
+
+  // Compare with broadcast frequencies
+  for (int i = 1; i < numBroadcastFrequencies; i++) {
+    float diff = abs(freq - broadcastFrequencies[i]);
+    if (diff < minDiff) {
+      closestFreq = broadcastFrequencies[i];
+      minDiff = diff;
     }
-    delay(5); // Small delay to allow ADC to settle
   }
-  return max;
+
+  // Compare with non-broadcast frequencies
+  for (int i = 0; i < numNonBroadcastFrequencies; i++) {
+    float diff = abs(freq - nonBroadcastFrequencies[i]);
+    if (diff < minDiff) {
+      closestFreq = nonBroadcastFrequencies[i];
+      minDiff = diff;
+    }
+  }
+
+  return closestFreq;
 }
 
+float quantizeVolume(float vol) {
+  float closestVol = volumePoints[0];
+  float minDiff = abs(vol - closestVol);
+  float diff = 0.0;
+
+  for (int i = 1; i < numVolumePoints; i++) {
+    diff = abs(vol - volumePoints[i]);
+    if (diff < minDiff) {
+      minDiff = diff;
+      closestVol = volumePoints[i];
+    }
+  }
+
+  return closestVol;
+}
+
+/*------------------------------- ENTRY POINT -------------------------------------*/
 void setup() {
   Wire.begin();
-  delay(200); // Wait for I2C bus to stabilize
-  
-  Serial.begin(9600);
+  delay(200);                                           // Wait for I2C bus to stabilize
   lcd.init();
-  delay(200); // Allow LCD to initialize
-
+  delay(200);                                           // Allow LCD to initialize
   lcd.backlight();
   lcd.clear();
-  lcd.print("Yello!...");
+  lcd.print("EEG 326 PROJECT");
+  delay(1000);
 
-  delay(500); // Give some time to display the initial message
-
-  //Set initial frequency
-  float smoothValFromTunePot = getSmoothedReading(tunePot, 10); // Average over 10 readings
-  currentFreq = mapFloat(smoothValFromTunePot, 0, 1023, 88.9, 107.5);
-  radio.setFrequency(currentFreq);
-
-  lcd.createChar(0, radio_character);
-  lcd.createChar(1, volume_character);
-  lcd.createChar(2, volume_bar);
-}
-void loop() {
-  float smoothTuneValue = getSmoothedReading(tunePot, 10); // Average over 10 readings
-  currentFreq = mapFloat(smoothTuneValue, 0, 1023, 88.9, 107.5);
-  currentFreq = quantizeFrequency(currentFreq);
+  lcd.clear();
+  lcd.createChar(0, volume_character);
+  lcd.setCursor(0, 1);
+  lcd.write(byte(0));     // volume icon, supposedly
   
-  float maxVolumeValue = getMaxReading(volumePot, 50);
-  mappedVolumeValue = map(maxVolumeValue, 0, 350, 0, 15);//Read value doesn't get to 1023
+  currentVol = quantizeVolume(mapFloat(getSmoothedReading(volume_pot, 2), 0, 1023, 0.0, 100.0));
+  prevVol = currentVol;
+  dtostrf(currentVol, 3, 1, volStr);
+  writeVolume(volStr);
+  radio.setFrequency(currentFreq);
+  dtostrf(currentFreq, 5, 1, freqStr);
+  writeToLcd(freqStr);
+}
 
-  Serial.print(smoothTuneValue);
-  Serial.print(" ");
-  Serial.println(maxVolumeValue);
+float prevFreq = DEFAULT_FREQ;
+float smoothVal;
+float smoothVol;
+void loop() {
+  smoothVal = getSmoothedReading(tunePot, 10);      // Average over 10 readings
+  smoothVol = getSmoothedReading(volume_pot, 10);
+  currentFreq = mapFloat(smoothVal, 0, 1023, 88.9, 107.5);
+  currentVol = mapFloat(smoothVol, 0, 1023, 0.0, 100.0);
+  currentFreq = quantizeFrequency(currentFreq);
+  currentVol = quantizeVolume(currentVol);
 
-  if (abs(prevFreq - currentFreq) > FREQ_ERROR) {
+  if (abs(prevFreq - currentFreq) > ERROR) {
     radio.setFrequency(currentFreq);
     dtostrf(currentFreq, 5, 1, freqStr);
+    writeToLcd(freqStr);
     prevFreq = currentFreq;
-    writeToLcd(freqStr, mappedVolumeValue);
   }
-  else if(abs(mappedVolumeValue - prevMappedVolumeValue) > VOLUME_ERROR) {
-    writeToLcd(freqStr, mappedVolumeValue);
-    prevMappedVolumeValue = mappedVolumeValue; 
+  if (abs(prevVol - currentVol) > ERROR) {
+    dtostrf(currentVol, 3, 1, volStr);
+    writeVolume(volStr);
+    prevVol = currentVol;
   }
-
-  //delay(400); // Adjust delay as needed
+  delay(500);
 }
